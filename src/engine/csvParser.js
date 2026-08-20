@@ -1,101 +1,89 @@
 /**
  * csvParser.js
  *
- * Converts raw CSV text into the typed objects the discount engine expects.
- * Uses papaparse for reliable CSV parsing, then maps column names to the
- * internal data shapes.
+ * CSV input adapter. Converts raw CSV text into the typed objects the engine
+ * expects, then routes every rule through the shared `validateRule` boundary.
+ * It knows about CSV columns; it knows nothing about discount maths.
  *
- * Expected rules.csv columns:
- *   rule_id, scope, applies_to, type, value, stackable
- *
- * Expected cart.csv columns:
- *   item_id, product, brand, platform, base_price
+ * rules.csv columns: rule_id, scope, applies_to, type, value, stackable, min_cart_value
+ * cart.csv  columns: item_id, product, brand, platform, base_price
  */
 
 import Papa from 'papaparse'
+import { validateRule } from './ruleValidation.js'
 
-/**
- * Parses the raw text of rules.csv into an array of DiscountRule objects.
- * Returns { data, errors } where errors is an array of row-level issues.
- */
-export function parseRulesCSV(csvText) {
-  const { data: rows, errors: parseErrors } = Papa.parse(csvText.trim(), {
+function parse(csvText) {
+  return Papa.parse(csvText.trim(), {
     header: true,
     skipEmptyLines: true,
     transformHeader: (h) => h.trim().toLowerCase().replace(/\s+/g, '_'),
   })
+}
 
+/**
+ * Guards against uploading the wrong file into the wrong drop zone
+ * (e.g. cart.csv into the rules area). Returns an error string, or null if ok.
+ */
+function checkHeaders(rows, required, label) {
+  if (rows.length === 0) return `This file appears to be empty.`
+  const present = Object.keys(rows[0])
+  const missing = required.filter((c) => !present.includes(c))
+  if (missing.length === required.length) {
+    return `This doesn't look like a ${label} file — expected columns like "${required.join('", "')}". Did you upload the wrong file here?`
+  }
+  return null
+}
+
+/** Parses rules.csv → { data: DiscountRule[], errors: string[] }. */
+export function parseRulesCSV(csvText) {
+  const { data: rows, errors: parseErrors } = parse(csvText)
   if (parseErrors.length > 0) {
     return { data: [], errors: parseErrors.map((e) => e.message) }
   }
+
+  const headerErr = checkHeaders(rows, ['rule_id', 'scope', 'type', 'value'], 'rules')
+  if (headerErr) return { data: [], errors: [headerErr] }
 
   const data = []
   const errors = []
 
   rows.forEach((row, i) => {
-    const rowNum = i + 2 // account for header row
-    const missing = []
+    const rowNum = i + 2 // +1 header, +1 for 1-based
+    const raw = {
+      ruleId: row.rule_id,
+      scope: row.scope,
+      appliesTo: row.applies_to,
+      type: row.type,
+      value: row.value,
+      stackable: row.stackable,
+      minCartValue: row.min_cart_value,
+    }
 
-    if (!row.rule_id) missing.push('rule_id')
-    if (!row.scope) missing.push('scope')
-    if (!row.applies_to) missing.push('applies_to')
-    if (!row.type) missing.push('type')
-    if (row.value === undefined || row.value === '') missing.push('value')
-    if (row.stackable === undefined || row.stackable === '') missing.push('stackable')
-
-    if (missing.length > 0) {
-      errors.push(`Row ${rowNum}: missing fields — ${missing.join(', ')}`)
+    if (!raw.ruleId || !String(raw.ruleId).trim()) {
+      errors.push(`Row ${rowNum}: missing rule_id`)
       return
     }
 
-    const scope = row.scope.trim().toLowerCase()
-    if (scope !== 'brand' && scope !== 'platform') {
-      errors.push(`Row ${rowNum}: scope must be "brand" or "platform", got "${row.scope}"`)
+    const result = validateRule(raw)
+    if (!result.ok) {
+      errors.push(`Row ${rowNum} (${raw.ruleId}): ${result.error}`)
       return
     }
-
-    const type = row.type.trim().toLowerCase()
-    if (type !== 'percentage' && type !== 'flat') {
-      errors.push(`Row ${rowNum}: type must be "percentage" or "flat", got "${row.type}"`)
-      return
-    }
-
-    const value = parseFloat(row.value)
-    if (isNaN(value) || value <= 0) {
-      errors.push(`Row ${rowNum}: value must be a positive number, got "${row.value}"`)
-      return
-    }
-
-    const stackableStr = row.stackable.trim().toLowerCase()
-    const stackable = stackableStr === 'true' || stackableStr === '1' || stackableStr === 'yes'
-
-    data.push({
-      ruleId: row.rule_id.trim(),
-      scope,
-      appliesTo: row.applies_to.trim(),
-      type,
-      value,
-      stackable,
-    })
+    data.push(result.rule)
   })
 
   return { data, errors }
 }
 
-/**
- * Parses the raw text of cart.csv into an array of CartItem objects.
- * Returns { data, errors } where errors is an array of row-level issues.
- */
+/** Parses cart.csv → { data: CartItem[], errors: string[] }. */
 export function parseCartCSV(csvText) {
-  const { data: rows, errors: parseErrors } = Papa.parse(csvText.trim(), {
-    header: true,
-    skipEmptyLines: true,
-    transformHeader: (h) => h.trim().toLowerCase().replace(/\s+/g, '_'),
-  })
-
+  const { data: rows, errors: parseErrors } = parse(csvText)
   if (parseErrors.length > 0) {
     return { data: [], errors: parseErrors.map((e) => e.message) }
   }
+
+  const headerErr = checkHeaders(rows, ['item_id', 'product', 'base_price'], 'cart')
+  if (headerErr) return { data: [], errors: [headerErr] }
 
   const data = []
   const errors = []
@@ -103,7 +91,6 @@ export function parseCartCSV(csvText) {
   rows.forEach((row, i) => {
     const rowNum = i + 2
     const missing = []
-
     if (!row.item_id) missing.push('item_id')
     if (!row.product) missing.push('product')
     if (!row.brand) missing.push('brand')
