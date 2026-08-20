@@ -7,7 +7,7 @@ English** (parsed by an LLM) or a cart can be loaded from a **PDF**.
 
 **Live demo:** https://discount-engine-assignment-two.vercel.app/
 
-**Loom walkthrough:** _<paste your Loom link here>_
+**Loom walkthrough:** https://www.loom.com/share/4bf8015a5f754e0dbbce7afae049a434
 
 ## Run locally (3 steps)
 
@@ -67,7 +67,7 @@ engine and results rendering don't change.
 
 ## The three tasks
 
-- **Cart-level offer** — after all item discounts, if the (unrounded) subtotal
+- **Cart-level offer** — after all item discounts, if the displayed cart subtotal
   meets a cart rule's threshold, the best cart rule applies to the whole total and
   shows as a separate line. Hidden if the threshold isn't met.
 - **Natural-language rule** — a text field → LLM → structured rule → **confirmation
@@ -106,7 +106,7 @@ Deliberate calls, each enforced in code:
 | Situation | Decision |
 |-----------|----------|
 | Cart total exactly equals threshold | Inclusive `≥` — the offer applies |
-| Threshold checked against which number? | The **unrounded** subtotal (see Rounding) |
+| Threshold checked against which number? | The **displayed cart subtotal** — the same number the customer sees (see Money) |
 | Two cart rules both qualify | Only the single best-saving one applies; cart rules don't stack |
 | `stackable` on a cart rule | Ignored (undefined at cart scope) |
 | Empty cart / all rows invalid | Renders Rs.0 gracefully, no crash |
@@ -141,28 +141,35 @@ Deliberate calls, each enforced in code:
 | A newer upload finishes before an older one | Request token ignores the stale result |
 | Scanned/image PDF (no text layer) | Clear "couldn't read this PDF" message |
 
-### Money — integer paise (the money-safe primitive)
+### Money — integer paise, one canonical subtotal
 
-All money is stored and computed as **integer paise** (₹1 = 100 paise) inside
-the engine. There is no floating-point money, which is what makes the pricing
-reliable:
+Item discounts are computed in **integer paise** (₹1 = 100 paise), so there is no
+floating-point money and no drift: the only rounding is the percentage step
+(a percentage of an integer can be fractional paise), rounded once to the nearest
+paise. Base prices are also preserved to paise on ingest (₹3,999.60 → `399960`),
+so item precision isn't lost before the engine runs.
 
-- **The cart threshold is compared exactly** — an exact ₹4,000 cart triggers a
-  `≥ 4,000` rule reliably (no float error like `3999.9999…`).
-- **Precision is preserved on ingest** — ₹3,999.60 becomes `399960` paise, not a
-  pre-rounded ₹4,000.
-- **One rounding point:** only the percentage step (a percentage of an integer
-  can be fractional paise) rounds, to the nearest paise.
-- **Display is derived, never independently rounded.** Whole-rupee figures come
-  from a single canonical value: a line's *saving* is `displayedBase −
-  displayedFinal`, and the cart total is `displayedSubtotal − displayedSaved`. So
-  the receipt always adds up and no two numbers can contradict each other (e.g. a
-  ₹5 item at 10% off shows "final ₹5, you save —", never "save ₹1").
+The customer-facing cart receipt is then built from **one canonical number** —
+the displayed whole-rupee subtotal:
 
-The one residual trade-off: because prices display in whole rupees but the
-threshold is decided in exact paise, a cart can display a rounded subtotal that
-differs from the exact value used for the threshold by under a rupee at a razor
-boundary — the standard, documented reality of any whole-rupee receipt.
+1. Each item's final price is rounded to whole rupees for display.
+2. Those displayed line prices are summed into the **cart subtotal**.
+3. That *same* subtotal drives everything else — threshold eligibility, comparing
+   cart rules, the cart saving, and the final total — and the saving is capped so
+   it can never exceed the subtotal.
+
+Because every cart figure derives from the one subtotal, the receipt is always
+internally consistent for *any* cart, including pathological sub-rupee ones: the
+line items always sum to the subtotal, the saving is always `0 ≤ saving ≤
+subtotal`, and `subtotal − saving === total`. A ₹5 item at 10% off shows
+"final ₹5, you save —", never "save ₹1"; and a cart of ten ₹1 items with a 50%
+offer shows ₹10 − ₹5 = ₹5, never an absurd total.
+
+The deliberate trade-off: whole-rupee display of sub-rupee item values is
+inherently lossy, and **eligibility is judged on the subtotal the customer
+actually sees** — so what's shown is what's charged (a cart displaying ₹4,000
+qualifies for a `≥ ₹4,000` offer). The exact paise subtotal is diagnostic only;
+it never changes the winning rule or the displayed total.
 
 ### LLM abuse controls
 
