@@ -135,29 +135,31 @@ export function processCart(cartItems, rules) {
 }
 
 /**
- * Builds the full cart summary with a money-safe, internally consistent receipt.
+ * Builds the full cart summary with a self-consistent, whole-rupee receipt.
  *
- *   - Threshold is checked against the EXACT paise subtotal (no float, so the
- *     exact-Rs.4,000 boundary is reliable).
- *   - Displayed figures are all in whole rupees and DERIVED so the receipt adds
- *     up: line saving = displayedBase − displayedFinal; cart total =
- *     displayedSubtotal − displayedSaved. Nothing is rounded independently.
+ * ONE BASE for the entire receipt: the displayed whole-rupee subtotal (the sum
+ * of the rounded line finals). Cart eligibility, the cart saving, and the final
+ * total are ALL computed from that same number — never a mix of exact-paise and
+ * rounded values. This guarantees, for any cart (including pathological
+ * sub-rupee ones):
+ *   - the line items always sum to the subtotal,
+ *   - the cart saving is never greater than the subtotal, and
+ *   - subtotal − saving === total, exactly.
+ *
+ * Trade-off (documented in the README): whole-rupee display of sub-rupee item
+ * values is inherently lossy, and cart-offer eligibility is judged on the
+ * subtotal the customer actually sees — so what's shown is what's charged.
  *
  * Returns:
  *   {
- *     items: DiscountResult[]          // paise
- *     lines: [{ ...display fields in rupees }]
- *     subtotal:   number (rupees)      // sum of rounded line finals
+ *     items: DiscountResult[]      // paise
+ *     lines: [{ ...display fields in rupees, saving = base − final }]
+ *     subtotal:   number (rupees)  // sum of rounded line finals
  *     cartOffer:  null | { ruleId, type, value, label, savedRupees }
- *     finalTotal: number (rupees)      // subtotal − cart saving (derived)
- *     subtotalPaise: number            // exact, used for the threshold
+ *     finalTotal: number (rupees)  // subtotal − saving
  *   }
  */
 export function summarizeCart(results, rules) {
-  const priced = results.filter((r) => !r.flagged)
-  const subtotalPaise = priced.reduce((sum, r) => sum + r.finalPrice, 0)
-
-  // Displayed lines — saving derived from displayed base/final (never independent).
   const lines = results.map((r) => {
     const baseR = paiseToRupees(r.basePrice)
     const finalR = r.flagged ? null : paiseToRupees(r.finalPrice)
@@ -166,34 +168,35 @@ export function summarizeCart(results, rules) {
       product: r.product,
       basePrice: baseR,
       finalPrice: finalR,
-      saved: r.flagged ? 0 : baseR - finalR,
+      saved: r.flagged ? 0 : baseR - finalR, // derived from displayed base/final
       reasoning: r.reasoning,
       flagged: r.flagged,
     }
   })
+
   const subtotal = lines.filter((l) => !l.flagged).reduce((s, l) => s + l.finalPrice, 0)
 
-  // Cart offer decided on the EXACT paise subtotal; best saving wins, no stacking.
-  const applicable = rules.filter((r) => r.scope === 'cart' && subtotalPaise >= toPaise(r.minCartValue))
+  // Everything below is computed on `subtotal` (the displayed rupee value).
+  const applicable = rules.filter((r) => r.scope === 'cart' && subtotal >= r.minCartValue)
   let cartOffer = null
-  let cartSavingPaise = 0
+  let saving = 0
   if (applicable.length > 0) {
     let best = null
     let bestSaving = -Infinity
     for (const rule of applicable) {
-      const saving = calculateDiscountAmount(subtotalPaise, rule)
-      if (saving > bestSaving) { best = rule; bestSaving = saving }
+      const s = rule.type === 'percentage' ? Math.round((subtotal * rule.value) / 100) : Math.min(rule.value, subtotal)
+      if (s > bestSaving) { best = rule; bestSaving = s }
     }
-    cartSavingPaise = bestSaving
+    saving = bestSaving // ≤ subtotal by construction (pct ≤ 100; flat capped at subtotal)
     cartOffer = {
       ruleId: best.ruleId,
       type: best.type,
       value: best.value,
       label: best.type === 'percentage' ? `Cart offer: ${best.value}% off` : `Cart offer: Rs.${best.value} off`,
-      savedRupees: paiseToRupees(cartSavingPaise),
+      savedRupees: saving,
     }
   }
 
-  const finalTotal = Math.max(0, subtotal - (cartOffer ? cartOffer.savedRupees : 0))
-  return { items: results, lines, subtotal, cartOffer, finalTotal, subtotalPaise }
+  const finalTotal = subtotal - saving
+  return { items: results, lines, subtotal, cartOffer, finalTotal }
 }

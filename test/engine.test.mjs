@@ -49,21 +49,35 @@ test('cart offer reproduces Rs.5,339 final total', () => {
 // ── Money-safety / the reviewer's bugs ──────────────────────────
 
 test('Rs.5 @ 10% off: receipt is internally consistent (no phantom saving)', () => {
-  const s = summarizeCart(processCart([item(5)], []).map(() => applyDiscounts(item(5), [brand('B', 'percentage', 10)])), [])
+  const s = summarizeCart(processCart([item(5)], [brand('B', 'percentage', 10)]), [])
   const l = s.lines[0]
   assert.equal(l.basePrice, 5)
   assert.equal(l.finalPrice, 5)
   assert.equal(l.saved, 0) // NOT 1 — saving is derived from displayed base/final
 })
 
-test('exact Rs.4,000 threshold triggers (integer paise, no float error)', () => {
-  const s = summarizeCart([line(200000), line(200000)], [cartRule(10, 4000)]) // 4000.00 exactly
+test('exact Rs.4,000 threshold triggers', () => {
+  const s = summarizeCart([line(200000), line(200000)], [cartRule(10, 4000)]) // Rs.2000 + Rs.2000
   assert.equal(s.cartOffer.ruleId, 'C')
 })
 
-test('one paise below the threshold does not trigger', () => {
-  const s = summarizeCart([line(399999)], [cartRule(10, 4000)])
+test('cart displaying below the threshold does not trigger', () => {
+  const s = summarizeCart([line(399900)], [cartRule(10, 4000)]) // Rs.3999
   assert.equal(s.cartOffer, null)
+})
+
+test('pathological sub-rupee cart: saving never exceeds subtotal (regression)', () => {
+  // 10 × Rs.149 at 99% off → Rs.1 each displayed; a 50% cart offer must stay sane.
+  const items = Array.from({ length: 10 }, (_, i) => ({ itemId: 'I' + i, product: 'p', brand: 'B', platform: 'P', basePrice: 14900 }))
+  const rules = [
+    { ruleId: 'R99', scope: 'brand', appliesTo: 'B', type: 'percentage', value: 99, stackable: false, minCartValue: null },
+    { ruleId: 'C50', scope: 'cart', appliesTo: '', type: 'percentage', value: 50, stackable: false, minCartValue: 1 },
+  ]
+  const s = summarizeCart(processCart(items, rules), rules)
+  assert.equal(s.subtotal, 10)
+  assert.ok(s.cartOffer.savedRupees <= s.subtotal, 'saving must not exceed subtotal')
+  assert.equal(s.finalTotal, s.subtotal - s.cartOffer.savedRupees)
+  assert.ok(s.finalTotal >= 0)
 })
 
 test('flat discount exceeding base clamps to 0', () => {
@@ -217,12 +231,15 @@ test('normalize collapses whitespace and case', () => assert.equal(normalize('  
 // ── Property tests (invariants over random inputs) ──────────────
 
 function randomRule(i) {
-  const scopes = ['brand', 'platform']
-  const types = ['percentage', 'flat']
-  const type = types[Math.floor(Math.random() * 2)]
+  const roll = Math.random()
+  if (roll < 0.3) {
+    // cart rule — these MUST be exercised (their absence hid the receipt bug)
+    return { ruleId: `C${i}`, scope: 'cart', appliesTo: '', type: 'percentage', value: Math.floor(Math.random() * 100) + 1, stackable: false, minCartValue: Math.floor(Math.random() * 5000) + 1 }
+  }
+  const type = Math.random() < 0.5 ? 'percentage' : 'flat'
   return {
     ruleId: `R${i}`,
-    scope: scopes[Math.floor(Math.random() * 2)],
+    scope: Math.random() < 0.5 ? 'brand' : 'platform',
     appliesTo: Math.random() < 0.5 ? 'B' : 'P',
     type,
     value: type === 'percentage' ? Math.floor(Math.random() * 100) + 1 : Math.floor(Math.random() * 500) + 1,
@@ -245,17 +262,23 @@ test('property: final price is always 0 ≤ final ≤ base', () => {
   }
 })
 
-test('property: displayed receipt always adds up', () => {
-  for (let t = 0; t < 500; t++) {
-    const rules = Array.from({ length: Math.floor(Math.random() * 4) }, (_, i) => randomRule(i))
-    const s = summarizeCart(processCart(randomCart(6), rules), rules)
-    // per-line: saved === base − final
-    for (const l of s.lines) {
-      if (!l.flagged) assert.equal(l.saved, l.basePrice - l.finalPrice)
-    }
-    // subtotal === sum of line finals; total === subtotal − cart saving
+test('property: receipt adds up AND cart saving never exceeds subtotal', () => {
+  for (let t = 0; t < 800; t++) {
+    // small values make sub-rupee rounding likely — the regression's danger zone
+    const cart = Array.from({ length: 8 }, (_, i) => ({ itemId: `I${i}`, product: 'p', brand: 'B', platform: 'P', basePrice: (Math.floor(Math.random() * 400) + 1) * 100 }))
+    const rules = Array.from({ length: Math.floor(Math.random() * 5) }, (_, i) => randomRule(i))
+    const s = summarizeCart(processCart(cart, rules), rules)
+
+    for (const l of s.lines) if (!l.flagged) assert.equal(l.saved, l.basePrice - l.finalPrice)
+
     const sumLines = s.lines.filter((l) => !l.flagged).reduce((a, l) => a + l.finalPrice, 0)
-    assert.equal(s.subtotal, sumLines)
+    assert.equal(s.subtotal, sumLines, 'subtotal === sum of line finals')
+
+    if (s.cartOffer) {
+      assert.ok(s.cartOffer.savedRupees >= 0, 'saving >= 0')
+      assert.ok(s.cartOffer.savedRupees <= s.subtotal, 'saving <= subtotal')
+    }
     assert.equal(s.finalTotal, s.subtotal - (s.cartOffer ? s.cartOffer.savedRupees : 0))
+    assert.ok(s.finalTotal >= 0, 'final total >= 0')
   }
 })
