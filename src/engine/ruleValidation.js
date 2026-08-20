@@ -3,14 +3,18 @@
  *
  * The single trust boundary for discount rules.
  *
- * Every input path — CSV upload, natural-language (LLM), and (future) any
- * other source — funnels its raw rule object through `validateRule` before it
- * is ever handed to the engine. Nothing downstream has to re-check a rule:
- * if it made it past here, it is structurally sound.
+ * Two entry points:
+ *   - validateRule(raw)        coercive — for CSV, where every cell is a string
+ *                              ("15", "true"). Normalises then domain-checks.
+ *   - validateRuleStrict(raw)  strict decoder — for LLM/JSON output, where types
+ *                              are real. Rejects wrong types (value: true,
+ *                              appliesTo: {...}) BEFORE the coercive pass, so the
+ *                              model can't smuggle a nonsense rule through
+ *                              JavaScript's loose coercion.
  *
- * This is the file the assignment's "inputs adapt to the engine, not the other
- * way around" principle hinges on. Adapters produce a raw shape; this validates
- * and normalises it into the canonical DiscountRule the engine consumes.
+ * Money note: `value` (flat rupees) and `minCartValue` (rupees) are kept in
+ * rupees as authored, for display. The engine converts them to integer paise at
+ * the point of calculation. Percentage `value` is a plain 0–100 number.
  */
 
 export const SCOPES = ['platform', 'brand', 'cart']
@@ -33,18 +37,11 @@ function err(reason) {
 }
 
 /**
- * Validates and normalises a raw rule into a canonical DiscountRule.
- *
- * Accepts a partial/loose object (from CSV columns or an LLM) with fields:
- *   ruleId?, scope, appliesTo?, type, value, stackable?, minCartValue?
- *
- * Returns { ok: true, rule } or { ok: false, error }.
- *
- * Decisions enforced here (all documented in the README):
- *   - scope ∈ {platform, brand, cart}
- *   - type  ∈ {percentage, flat}
- *   - value > 0; and for percentage, value ≤ 100  (blocks "150% off")
- *   - cart rules REQUIRE a positive minCartValue and ignore appliesTo/stackable
+ * Coercive validation + normalisation into a canonical DiscountRule.
+ * Decisions enforced (all documented in the README):
+ *   - scope ∈ {platform, brand, cart}; type ∈ {percentage, flat}
+ *   - value > 0; percentage value ≤ 100  (blocks "150% off")
+ *   - cart rules REQUIRE a positive minCartValue; ignore appliesTo/stackable
  *   - non-cart rules REQUIRE a non-empty appliesTo target
  */
 export function validateRule(raw) {
@@ -60,8 +57,8 @@ export function validateRule(raw) {
     return err(`type must be "percentage" or "flat" — got "${raw.type ?? ''}"`)
   }
 
-  const value = Number(raw.value)
-  if (!Number.isFinite(value) || value <= 0) {
+  const value = toStrictNumber(raw.value)
+  if (value === null || value <= 0) {
     return err(`value must be a positive number — got "${raw.value ?? ''}"`)
   }
   if (type === 'percentage' && value > 100) {
@@ -72,8 +69,8 @@ export function validateRule(raw) {
 
   let minCartValue = null
   if (scope === 'cart') {
-    minCartValue = Number(raw.minCartValue)
-    if (!Number.isFinite(minCartValue) || minCartValue <= 0) {
+    minCartValue = toStrictNumber(raw.minCartValue)
+    if (minCartValue === null || minCartValue <= 0) {
       return err('a cart rule needs a positive minimum cart value (e.g. "cart total ≥ Rs.4,000")')
     }
   } else if (!appliesTo) {
@@ -81,16 +78,48 @@ export function validateRule(raw) {
   }
 
   const rule = {
-    ruleId: String(raw.ruleId ?? '').trim() || null, // callers assign one if absent
+    ruleId: String(raw.ruleId ?? '').trim() || null,
     scope,
-    // Cart rules apply to the whole cart, so appliesTo is meaningless for them.
     appliesTo: scope === 'cart' ? '' : appliesTo,
     type,
     value,
-    // stackable is only defined for item-level rules; cart rules never stack.
     stackable: scope === 'cart' ? false : coerceBool(raw.stackable),
     minCartValue,
   }
-
   return { ok: true, rule }
+}
+
+/**
+ * Strict decoder for LLM/JSON output. Rejects wrong JS types up front — e.g.
+ * value:true, minCartValue:true, appliesTo:{name:"Nike"} — then defers to the
+ * shared domain checks. This is the "strict decoder before normalization" the
+ * CSV path deliberately doesn't need (CSV cells are always strings).
+ */
+export function validateRuleStrict(raw) {
+  if (!raw || typeof raw !== 'object') return err('rule is not an object')
+
+  if (typeof raw.scope !== 'string') return err('scope must be a string')
+  if (typeof raw.type !== 'string') return err('type must be a string')
+  if (typeof raw.value !== 'number' || !Number.isFinite(raw.value)) {
+    return err('value must be a finite number')
+  }
+  if (raw.appliesTo != null && typeof raw.appliesTo !== 'string') {
+    return err('appliesTo must be a string or null')
+  }
+  if (raw.stackable != null && typeof raw.stackable !== 'boolean') {
+    return err('stackable must be a boolean')
+  }
+  if (raw.minCartValue != null && (typeof raw.minCartValue !== 'number' || !Number.isFinite(raw.minCartValue))) {
+    return err('minCartValue must be a finite number or null')
+  }
+  return validateRule(raw)
+}
+
+/** Parse a number strictly: rejects "", "100abc", Infinity, NaN. */
+function toStrictNumber(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null
+  const t = String(v ?? '').trim()
+  if (t === '') return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : null
 }

@@ -7,6 +7,8 @@ English** (parsed by an LLM) or a cart can be loaded from a **PDF**.
 
 **Live demo:** https://discount-engine-assignment-two.vercel.app/
 
+**Loom walkthrough:** _<paste your Loom link here>_
+
 ## Run locally (3 steps)
 
 ```bash
@@ -18,6 +20,12 @@ npm run dev               # http://localhost:5173
 Upload `sample-data/rules.csv` and `sample-data/cart.csv`, click **Calculate
 Discounts**, and you should see the expected results below. (Task 2's plain-English
 input needs the Groq key; everything else works without it.)
+
+Run the test suite with:
+
+```bash
+npm test        # node:test — engine, adapters, validation + property tests
+```
 
 ## Expected results (sample data)
 
@@ -92,6 +100,7 @@ Deliberate calls, each enforced in code:
 | Multiple stackable rules of mixed type | Percentages applied first, then flats (order matters once both stack) — deterministic |
 | Stackable rule matches but no non-stackable rule does | The stackable rule still applies on its own |
 | Brand/platform text like "Amazon india" vs "Amazon India" | Matching is trim + lowercase + whitespace-collapsed |
+| Garbage numbers (`100abc`, `Infinity`) / duplicate IDs in CSV | Rejected per-row with a clear message |
 
 ### Cart pricing
 | Situation | Decision |
@@ -106,7 +115,9 @@ Deliberate calls, each enforced in code:
 | Situation | Decision |
 |-----------|----------|
 | Ambiguous ("discount for big orders") | Surfaced as unresolvable with a reason; nothing is guessed |
-| LLM returns non-JSON / fences / bad fields | Stripped, parsed, then **re-validated** via the shared boundary before the confirm step |
+| LLM returns non-JSON / fences / bad fields | Stripped, parsed, then **strictly type-decoded** (`validateRuleStrict`) — wrong types like `value: true` are rejected, not coerced — before the confirm step |
+| LLM/network is slow or hangs | 10s abort timeout + `max_tokens` cap + input length limit on the server |
+| User edits the text after parsing | The stale confirmation card is invalidated immediately |
 | Input describes two rules | The first is parsed **and a visible notice** says others were present — never silently dropped |
 | Rule targets a brand not in the cart | Accepted (valid but inactive) with a transparent note on the confirm card |
 | Negative / out-of-range value | Rejected at validation |
@@ -122,18 +133,43 @@ Deliberate calls, each enforced in code:
 | Header / divider / order lines | Skipped as structural, not treated as data |
 | Currency noise (`Rs.` / `₹` / commas / decimals) | Normalised to a number |
 | Some rows parse, some don't | Good rows load; bad rows shown with row number + reason |
+| **All rows fail / empty PDF** | The existing cart is **preserved** (import is atomic — a failed parse never wipes the cart) |
+| Negative price (`Rs.-500`) | Skipped as non-positive, never read as `₹500` |
+| Repeated header on a later page | Skipped as structural, not flagged as a bad row |
+| `getPage`/`getTextContent` throws mid-read | Caught; clean error; uploader never hangs on "Reading PDF…" |
+| Oversized / many-page PDF | Rejected up front (5 MB / 20-page guards) |
+| A newer upload finishes before an older one | Request token ignores the stale result |
 | Scanned/image PDF (no text layer) | Clear "couldn't read this PDF" message |
 
-### Rounding
-Prices are shown in whole rupees (the spec's expected figures are all whole
-rupees, though the maths produces fractions like Rs.1,104.15). The policy:
+### Money — integer paise (the money-safe primitive)
 
-- **Full precision internally** — no rounding mid-calculation.
-- **Round only at render.**
-- **The cart threshold is checked against the unrounded subtotal**, so a cart at
-  Rs.3,999.60 does not get falsely rounded up over a Rs.4,000 threshold.
-- **Line-sum guard:** the displayed cart total is derived from the rounded line
-  items, so the receipt visibly adds up.
+All money is stored and computed as **integer paise** (₹1 = 100 paise) inside
+the engine. There is no floating-point money, which is what makes the pricing
+reliable:
+
+- **The cart threshold is compared exactly** — an exact ₹4,000 cart triggers a
+  `≥ 4,000` rule reliably (no float error like `3999.9999…`).
+- **Precision is preserved on ingest** — ₹3,999.60 becomes `399960` paise, not a
+  pre-rounded ₹4,000.
+- **One rounding point:** only the percentage step (a percentage of an integer
+  can be fractional paise) rounds, to the nearest paise.
+- **Display is derived, never independently rounded.** Whole-rupee figures come
+  from a single canonical value: a line's *saving* is `displayedBase −
+  displayedFinal`, and the cart total is `displayedSubtotal − displayedSaved`. So
+  the receipt always adds up and no two numbers can contradict each other (e.g. a
+  ₹5 item at 10% off shows "final ₹5, you save —", never "save ₹1").
+
+The one residual trade-off: because prices display in whole rupees but the
+threshold is decided in exact paise, a cart can display a rounded subtotal that
+differs from the exact value used for the threshold by under a rupee at a razor
+boundary — the standard, documented reality of any whole-rupee receipt.
+
+### LLM abuse controls
+
+The serverless proxy bounds per-request cost (input length limit, `max_tokens`
+cap, and a 10s abort timeout). True per-IP rate limiting would need a shared
+store (Vercel KV / Upstash) and is out of scope for this prototype — noted as the
+next step before the endpoint were truly public.
 
 ## Deploy
 

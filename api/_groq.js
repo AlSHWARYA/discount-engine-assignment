@@ -49,6 +49,9 @@ Examples:
  * @returns {Promise<{resolvable:boolean, reason:string, rules:object[]}>}
  * @throws  {Error} with .status for config/network/model failures
  */
+const MAX_INPUT_CHARS = 500
+const TIMEOUT_MS = 10_000
+
 export async function parseRule(text) {
   const apiKey = process.env.GROQ_API_KEY
   if (!apiKey) {
@@ -56,12 +59,21 @@ export async function parseRule(text) {
     e.status = 500
     throw e
   }
-  if (!text || !String(text).trim()) {
+  const input = String(text ?? '').trim()
+  if (!input) {
     const e = new Error('No rule text provided.')
     e.status = 400
     throw e
   }
+  // Bound per-request cost so a public endpoint can't be used to burn quota.
+  if (input.length > MAX_INPUT_CHARS) {
+    const e = new Error(`Rule text is too long (max ${MAX_INPUT_CHARS} characters).`)
+    e.status = 400
+    throw e
+  }
 
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
   let resp
   try {
     resp = await fetch(GROQ_URL, {
@@ -73,17 +85,22 @@ export async function parseRule(text) {
       body: JSON.stringify({
         model: MODEL,
         temperature: 0,
+        max_tokens: 300, // a rule is tiny; cap output
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: String(text).trim() },
+          { role: 'user', content: input },
         ],
       }),
+      signal: controller.signal,
     })
   } catch (networkErr) {
-    const e = new Error('Could not reach the language model. Check your connection and try again.')
-    e.status = 502
+    const timedOut = networkErr?.name === 'AbortError'
+    const e = new Error(timedOut ? 'The parser timed out. Please try again.' : 'Could not reach the language model. Check your connection and try again.')
+    e.status = timedOut ? 504 : 502
     throw e
+  } finally {
+    clearTimeout(timer)
   }
 
   if (!resp.ok) {
@@ -113,7 +130,9 @@ export async function parseRule(text) {
   }
 
   return {
-    resolvable: parsed.resolvable !== false,
+    // Strict: only an actual boolean true counts as resolvable; anything else
+    // (missing, "false" string, null) defaults to "ask the user to clarify".
+    resolvable: parsed.resolvable === true,
     reason: typeof parsed.reason === 'string' ? parsed.reason : '',
     rules: Array.isArray(parsed.rules) ? parsed.rules : [],
   }

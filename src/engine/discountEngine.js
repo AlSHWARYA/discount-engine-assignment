@@ -1,49 +1,46 @@
 /**
  * discountEngine.js
  *
- * Pure discount calculation logic. No UI, no side effects, no knowledge of
- * where its inputs came from (CSV, LLM, or PDF). It takes CartItem[] and
- * DiscountRule[] and returns results. This is the calculator the assignment
- * says must NOT be reshaped to accommodate new input modes.
+ * Pure discount calculation. No UI, no I/O, no knowledge of input source.
  *
- * Precision policy (see README "Rounding"):
- *   - All arithmetic here runs in full floating-point precision.
- *   - Rounding to whole rupees happens ONLY at render time.
- *   - The cart threshold is checked against the UNROUNDED subtotal.
- *   - `summarizeCart` also returns display integers whose lines visibly sum
- *     to the displayed total (the "line-sum guard").
+ * MONEY IS INTEGER PAISE. Every price/discount here is an integer number of
+ * paise (₹1 = 100 paise). This is the money-safe primitive: there is no
+ * floating-point money, so the cart threshold is compared exactly and the
+ * "when to round" problem collapses. The ONLY rounding is the percentage step
+ * (a percentage of an integer can be fractional paise), rounded once, to the
+ * nearest paise.
+ *
+ * Rule money stays authored: rule.value is a 0–100 percent OR flat rupees;
+ * rule.minCartValue is rupees. They are converted to paise at point of use.
  *
  * Data shapes:
- *
- * DiscountRule {
- *   ruleId, scope: "brand"|"platform"|"cart", appliesTo, type: "percentage"|"flat",
- *   value: number, stackable: boolean, minCartValue: number|null
- * }
- * CartItem   { itemId, product, brand, platform, basePrice }
- * DiscountResult {
- *   itemId, product, brand, platform, basePrice, finalPrice, totalDiscount,
- *   appliedRules: string[], skippedRules: string[], reasoning: string, flagged: boolean
- * }
+ *   CartItem { itemId, product, brand, platform, basePrice }   // basePrice in PAISE
+ *   DiscountRule { ruleId, scope, appliesTo, type, value, stackable, minCartValue }
+ *   DiscountResult { ..., basePrice, finalPrice, totalDiscount }  // all PAISE
  */
 
 import { normalize } from './ruleValidation.js'
 
+const RUPEE = 100 // paise per rupee
+const toPaise = (rupees) => Math.round(rupees * RUPEE)
+export const paiseToRupees = (paise) => Math.round(paise / RUPEE)
+
 /** Returns true if an item-level rule (brand/platform) applies to this item. */
 export function ruleMatchesItem(item, rule) {
-  if (rule.scope === 'cart') return false // cart rules never match individual items
+  if (rule.scope === 'cart') return false
   if (rule.scope === 'brand') return normalize(item.brand) === normalize(rule.appliesTo)
   if (rule.scope === 'platform') return normalize(item.platform) === normalize(rule.appliesTo)
   return false
 }
 
 /**
- * Rupee discount a rule gives on a given price (full precision).
- * Uses the price passed in — important for stacking on the discounted price.
- * Flat discounts are capped at the price so a result can never go negative.
+ * Discount a rule gives on a price, in PAISE. Uses the price passed in (so
+ * stacking compounds on the discounted price). Flat discounts are capped at the
+ * price so a result can never go negative.
  */
-export function calculateDiscountAmount(price, rule) {
-  if (rule.type === 'percentage') return (price * rule.value) / 100
-  if (rule.type === 'flat') return Math.min(rule.value, price)
+export function calculateDiscountAmount(pricePaise, rule) {
+  if (rule.type === 'percentage') return Math.round((pricePaise * rule.value) / 100)
+  if (rule.type === 'flat') return Math.min(toPaise(rule.value), pricePaise)
   return 0
 }
 
@@ -55,38 +52,25 @@ function ruleToReasoning(rule) {
   return `${scopeLabel} offer applied`
 }
 
-/**
- * Picks the non-stackable rule giving the largest rupee saving on `basePrice`.
- * Tie-break is deterministic: the rule appearing FIRST in load order wins
- * (documented). Returns { winner, skipped }.
- */
-function pickWinner(nonStackable, basePrice) {
+/** Largest-saving non-stackable rule; ties broken by load order (first wins). */
+function pickWinner(nonStackable, basePaise) {
   let winner = null
   let winnerSaving = -Infinity
   const skipped = []
   for (const rule of nonStackable) {
-    const saving = calculateDiscountAmount(basePrice, rule)
+    const saving = calculateDiscountAmount(basePaise, rule)
     if (saving > winnerSaving) {
       if (winner) skipped.push(winner)
       winner = rule
       winnerSaving = saving
     } else {
-      skipped.push(rule) // strictly-greater test ⇒ ties keep the earlier rule
+      skipped.push(rule)
     }
   }
   return { winner, skipped }
 }
 
-/**
- * Applies the active rules to a single cart item. Returns a DiscountResult.
- *
- *   1. Guard invalid prices (≤ 0) — flagged, never priced.
- *   2. Match item-level rules only (cart rules are excluded here).
- *   3. Among non-stackable matches, apply the largest-saving one.
- *   4. Apply stackable rules on top, percentages before flats (order matters
- *      once a flat and a percentage stack — documented).
- *   5. Clamp final price at 0.
- */
+/** Applies the active rules to one cart item. Returns a DiscountResult (paise). */
 export function applyDiscounts(item, rules) {
   const base = {
     itemId: item.itemId,
@@ -96,30 +80,14 @@ export function applyDiscounts(item, rules) {
     basePrice: item.basePrice,
   }
 
-  if (!Number.isFinite(item.basePrice) || item.basePrice <= 0) {
-    return {
-      ...base,
-      finalPrice: 0,
-      totalDiscount: 0,
-      appliedRules: [],
-      skippedRules: [],
-      reasoning: 'Invalid base price — item skipped',
-      flagged: true,
-    }
+  if (!Number.isInteger(item.basePrice) || item.basePrice <= 0) {
+    return { ...base, finalPrice: 0, totalDiscount: 0, appliedRules: [], skippedRules: [], reasoning: 'Invalid base price — item skipped', flagged: true }
   }
 
   const matching = rules.filter((r) => r.scope !== 'cart' && ruleMatchesItem(item, r))
 
   if (matching.length === 0) {
-    return {
-      ...base,
-      finalPrice: item.basePrice,
-      totalDiscount: 0,
-      appliedRules: [],
-      skippedRules: [],
-      reasoning: 'No offers available',
-      flagged: false,
-    }
+    return { ...base, finalPrice: item.basePrice, totalDiscount: 0, appliedRules: [], skippedRules: [], reasoning: 'No offers available', flagged: false }
   }
 
   const nonStackable = matching.filter((r) => !r.stackable)
@@ -137,21 +105,19 @@ export function applyDiscounts(item, rules) {
     reasoningParts.push(ruleToReasoning(winner))
   }
 
-  // Percentages first, then flats — deterministic and order-stable.
+  // Percentages first, then flats — order matters once both stack; deterministic.
   const orderedStackable = [...stackable].sort((a, b) => {
     const ta = a.type === 'percentage' ? 0 : 1
     const tb = b.type === 'percentage' ? 0 : 1
     return ta - tb || String(a.ruleId).localeCompare(String(b.ruleId))
   })
-
   for (const rule of orderedStackable) {
     price -= calculateDiscountAmount(price, rule)
     appliedRules.push(rule.ruleId)
     reasoningParts.push(ruleToReasoning(rule))
   }
 
-  const finalPrice = Math.max(0, price) // clamp (full precision retained)
-
+  const finalPrice = Math.max(0, price)
   return {
     ...base,
     finalPrice,
@@ -163,67 +129,71 @@ export function applyDiscounts(item, rules) {
   }
 }
 
-/** Runs applyDiscounts across every cart item. Returns DiscountResult[]. */
+/** Runs applyDiscounts across every cart item. */
 export function processCart(cartItems, rules) {
   return cartItems.map((item) => applyDiscounts(item, rules))
 }
 
-const round = (x) => Math.round(x)
-
 /**
- * Builds the full cart summary, including the cart-level offer.
+ * Builds the full cart summary with a money-safe, internally consistent receipt.
  *
- * Threshold decision uses the UNROUNDED subtotal (sum of precise item finals).
- * Displayed figures round each line and derive the total from those rounded
- * lines, so the receipt visibly adds up (line-sum guard). Only the single
- * best-saving cart rule applies; cart rules do not stack with each other.
+ *   - Threshold is checked against the EXACT paise subtotal (no float, so the
+ *     exact-Rs.4,000 boundary is reliable).
+ *   - Displayed figures are all in whole rupees and DERIVED so the receipt adds
+ *     up: line saving = displayedBase − displayedFinal; cart total =
+ *     displayedSubtotal − displayedSaved. Nothing is rounded independently.
  *
  * Returns:
  *   {
- *     items:        DiscountResult[]          — precise
- *     subtotal:     number  (integer rupees)  — sum of rounded item finals
- *     cartOffer:    null | { ruleId, label, value, type, savedRupees }
- *     finalTotal:   number  (integer rupees)  — subtotal − cart saving
- *     preciseSubtotal: number                 — used for the threshold check
+ *     items: DiscountResult[]          // paise
+ *     lines: [{ ...display fields in rupees }]
+ *     subtotal:   number (rupees)      // sum of rounded line finals
+ *     cartOffer:  null | { ruleId, type, value, label, savedRupees }
+ *     finalTotal: number (rupees)      // subtotal − cart saving (derived)
+ *     subtotalPaise: number            // exact, used for the threshold
  *   }
  */
 export function summarizeCart(results, rules) {
   const priced = results.filter((r) => !r.flagged)
-  const preciseSubtotal = priced.reduce((sum, r) => sum + r.finalPrice, 0)
-  const displaySubtotal = priced.reduce((sum, r) => sum + round(r.finalPrice), 0)
+  const subtotalPaise = priced.reduce((sum, r) => sum + r.finalPrice, 0)
 
-  const applicable = rules.filter(
-    (r) => r.scope === 'cart' && preciseSubtotal >= r.minCartValue
-  )
+  // Displayed lines — saving derived from displayed base/final (never independent).
+  const lines = results.map((r) => {
+    const baseR = paiseToRupees(r.basePrice)
+    const finalR = r.flagged ? null : paiseToRupees(r.finalPrice)
+    return {
+      itemId: r.itemId,
+      product: r.product,
+      basePrice: baseR,
+      finalPrice: finalR,
+      saved: r.flagged ? 0 : baseR - finalR,
+      reasoning: r.reasoning,
+      flagged: r.flagged,
+    }
+  })
+  const subtotal = lines.filter((l) => !l.flagged).reduce((s, l) => s + l.finalPrice, 0)
 
+  // Cart offer decided on the EXACT paise subtotal; best saving wins, no stacking.
+  const applicable = rules.filter((r) => r.scope === 'cart' && subtotalPaise >= toPaise(r.minCartValue))
   let cartOffer = null
+  let cartSavingPaise = 0
   if (applicable.length > 0) {
-    // largest saving wins; ties → first in load order
     let best = null
     let bestSaving = -Infinity
     for (const rule of applicable) {
-      const saving = calculateDiscountAmount(preciseSubtotal, rule)
-      if (saving > bestSaving) {
-        best = rule
-        bestSaving = saving
-      }
+      const saving = calculateDiscountAmount(subtotalPaise, rule)
+      if (saving > bestSaving) { best = rule; bestSaving = saving }
     }
-    // Saving for display is computed off the displayed subtotal so the
-    // rendered line and total stay internally consistent.
-    const savedRupees = round(calculateDiscountAmount(displaySubtotal, best))
+    cartSavingPaise = bestSaving
     cartOffer = {
       ruleId: best.ruleId,
       type: best.type,
       value: best.value,
-      label:
-        best.type === 'percentage'
-          ? `Cart offer: ${best.value}% off`
-          : `Cart offer: Rs.${best.value} off`,
-      savedRupees,
+      label: best.type === 'percentage' ? `Cart offer: ${best.value}% off` : `Cart offer: Rs.${best.value} off`,
+      savedRupees: paiseToRupees(cartSavingPaise),
     }
   }
 
-  const finalTotal = Math.max(0, displaySubtotal - (cartOffer ? cartOffer.savedRupees : 0))
-
-  return { items: results, subtotal: displaySubtotal, cartOffer, finalTotal, preciseSubtotal }
+  const finalTotal = Math.max(0, subtotal - (cartOffer ? cartOffer.savedRupees : 0))
+  return { items: results, lines, subtotal, cartOffer, finalTotal, subtotalPaise }
 }

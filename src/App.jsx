@@ -4,11 +4,13 @@
  * Top-level UI + state. Its job is wiring: each INPUT MODE (CSV, natural
  * language, PDF) produces the engine's canonical shapes (DiscountRule[],
  * CartItem[]), and the engine runs without knowing which input produced them.
- * Adding a fourth input mode would mean a new adapter + a new control here —
- * the engine and results rendering below stay untouched.
+ *
+ * Money is paise inside the engine; this component renders whole rupees using
+ * the DERIVED display figures from summarizeCart (so the receipt always adds up
+ * and no two numbers can contradict each other).
  */
 
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import CsvUploader from './components/CsvUploader.jsx'
 import PdfUploader from './components/PdfUploader.jsx'
 import NlRuleInput from './components/NlRuleInput.jsx'
@@ -19,6 +21,12 @@ import { parsePdfCart } from './adapters/pdfCartAdapter.js'
 import { processCart, summarizeCart } from './engine/discountEngine.js'
 
 // ── Column definitions ───────────────────────────────────────────
+
+const rupeesFromPaise = (paise) => {
+  const r = paise / 100
+  return `Rs.${(Number.isInteger(r) ? r : r).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
+}
+const rupees = (n) => `Rs.${n.toLocaleString('en-IN')}`
 
 const RULES_COLUMNS = [
   { key: 'ruleId', label: 'Rule ID' },
@@ -35,11 +43,10 @@ const CART_COLUMNS = [
   { key: 'product', label: 'Product' },
   { key: 'brand', label: 'Brand' },
   { key: 'platform', label: 'Platform' },
-  { key: 'basePrice', label: 'Base Price', render: (v) => `Rs.${v.toLocaleString('en-IN')}` },
+  { key: 'basePrice', label: 'Base Price', render: (v) => rupeesFromPaise(v) },
 ]
 
-const rupees = (v) => `Rs.${Math.round(v).toLocaleString('en-IN')}`
-
+// Operates on the DERIVED display lines from summarizeCart (all rupees).
 const RESULTS_COLUMNS = [
   { key: 'itemId', label: 'Item' },
   { key: 'product', label: 'Product' },
@@ -48,11 +55,11 @@ const RESULTS_COLUMNS = [
     key: 'finalPrice', label: 'Final Price',
     render: (v, row) =>
       row.flagged ? <span style={{ color: '#888' }}>—</span> : (
-        <span style={{ fontWeight: 700, color: row.totalDiscount > 0 ? '#1e5c2c' : '#131A48' }}>{rupees(v)}</span>
+        <span style={{ fontWeight: 700, color: row.saved > 0 ? '#1e5c2c' : '#131A48' }}>{rupees(v)}</span>
       ),
   },
   {
-    key: 'totalDiscount', label: 'You Save',
+    key: 'saved', label: 'You Save',
     render: (v, row) =>
       !row.flagged && v > 0
         ? <span style={{ color: '#1e5c2c', fontWeight: 600 }}>{rupees(v)}</span>
@@ -103,11 +110,11 @@ export default function App() {
   const [pdfSkipped, setPdfSkipped] = useState([])
   const [pdfError, setPdfError] = useState('')
   const [pdfBusy, setPdfBusy] = useState(false)
+  const pdfToken = useRef(0)
 
   const [customCount, setCustomCount] = useState(0)
   const [showResults, setShowResults] = useState(false)
 
-  // The engine re-runs automatically whenever rules or cart change (once shown).
   const summary = useMemo(
     () => (showResults && cartItems.length > 0 ? summarizeCart(processCart(cartItems, rules), rules) : null),
     [showResults, cartItems, rules]
@@ -133,31 +140,41 @@ export default function App() {
   }
 
   async function handleCartPdfLoad(file) {
+    const token = ++pdfToken.current
     setPdfBusy(true)
     setPdfError('')
-    setCartErrors([])
-    const { items, skipped, error } = await parsePdfCart(file)
-    setPdfBusy(false)
-    if (error) {
-      setPdfError(error)
-      return
+    try {
+      const { items, skipped, error } = await parsePdfCart(file)
+      if (token !== pdfToken.current) return // a newer upload superseded this one
+      if (error) {
+        setPdfError(error)
+        return
+      }
+      if (items.length === 0) {
+        // Atomic: a failed/empty import must NOT destroy the existing cart.
+        setPdfSkipped(skipped)
+        setPdfError('No items could be read from this PDF — keeping your current cart.')
+        return
+      }
+      setCartItems(items) // PDF replaces the current cart
+      setPdfSkipped(skipped)
+      setCartFileName(file.name)
+      setCartSource('pdf')
+      setCartErrors([])
+      setShowResults(true)
+    } finally {
+      if (token === pdfToken.current) setPdfBusy(false)
     }
-    setCartItems(items)          // PDF replaces the current cart
-    setPdfSkipped(skipped)
-    setCartFileName(file.name)
-    setCartSource('pdf')
-    if (items.length > 0) setShowResults(true) // re-run automatically
   }
 
   function handleAddCustomRule(rule) {
     const n = customCount + 1
     setCustomCount(n)
     setRules((prev) => [...prev, { ...rule, ruleId: `RULE-CUSTOM-${n}` }])
-    if (cartItems.length > 0) setShowResults(true) // re-run automatically with the new rule
+    if (cartItems.length > 0) setShowResults(true)
   }
 
   const canCalculate = cartItems.length > 0
-  const results = summary?.items ?? []
 
   // ── Render ──
 
@@ -228,7 +245,7 @@ export default function App() {
         {summary && (
           <div style={S.section}>
             <div style={S.sectionTitle}>Cart Summary</div>
-            <DataTable columns={RESULTS_COLUMNS} rows={results} />
+            <DataTable columns={RESULTS_COLUMNS} rows={summary.lines} />
 
             <div style={S.summaryRow}>
               <span style={{ color: '#555' }}>Cart total before offer</span>

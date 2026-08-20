@@ -12,7 +12,7 @@
  *   { status: 'error',        reason }             — LLM/network/validation failure
  */
 
-import { validateRule } from '../engine/ruleValidation.js'
+import { validateRuleStrict } from '../engine/ruleValidation.js'
 
 export async function parseNaturalLanguageRule(text) {
   if (!text || !text.trim()) {
@@ -43,7 +43,7 @@ export async function parseNaturalLanguageRule(text) {
 
   // Multi-rule input: take the first, tell the UI others were present (never silently drop).
   const extraCount = payload.rules.length - 1
-  const validated = validateRule(payload.rules[0])
+  const validated = validateRuleStrict(payload.rules[0])
   if (!validated.ok) {
     return { status: 'error', reason: `Parsed rule was invalid: ${validated.error}` }
   }

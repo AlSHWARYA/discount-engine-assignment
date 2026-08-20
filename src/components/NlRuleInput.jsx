@@ -79,6 +79,18 @@ export default function NlRuleInput({ onAddRule, cartItems }) {
     setStatus('idle')
   }
 
+  // Editing the text after a parse invalidates the old result — never let a
+  // confirmation card linger for text the user has since changed.
+  function handleTextChange(e) {
+    setText(e.target.value)
+    if (status !== 'idle' && status !== 'parsing') {
+      setParsed(null)
+      setExtraCount(0)
+      setMessage('')
+      setStatus('idle')
+    }
+  }
+
   // Transparency note: does anything currently in the cart match this rule?
   const matchesCart =
     parsed &&
@@ -102,7 +114,7 @@ export default function NlRuleInput({ onAddRule, cartItems }) {
         rows={2}
         placeholder='e.g. "20% off for Natura Casa brand, stackable with other offers"'
         value={text}
-        onChange={(e) => setText(e.target.value)}
+        onChange={handleTextChange}
         disabled={status === 'parsing'}
       />
       <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
