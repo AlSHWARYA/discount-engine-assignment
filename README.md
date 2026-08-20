@@ -5,7 +5,7 @@ shows the final price of each item, the offer applied in plain language, and a
 cart-level offer if the total qualifies. Rules can also be added in **plain
 English** (parsed by an LLM) or a cart can be loaded from a **PDF**.
 
-**Live demo:** _<LIVE_URL_GOES_HERE>_
+**Live demo:** https://discount-engine-assignment-two.vercel.app/
 
 ## Run locally (3 steps)
 
